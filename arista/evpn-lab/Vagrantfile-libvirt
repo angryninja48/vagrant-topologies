@@ -1,0 +1,582 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Created: 2019-03-06--11-57-39
+
+def get_mac(oui="28:b7:ad")
+  "Generate a MAC address"
+  nic = (1..3).map{"%0.2x"%rand(256)}.join(":")
+  return "#{oui}:#{nic}"
+end
+
+cwd = Dir.pwd.split("/").last
+username = ENV['USER']
+domain_prefix = "#{username}_#{cwd}"
+domain_uuid = "a0d3ce52-5876-5088-8ee0-dfb88b82169f"
+
+Vagrant.require_version ">= 2.1.0"
+Vagrant.configure("2") do |config|
+
+  config.vm.define "leaf02" do |node|
+    guest_name = "leaf02"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 4
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:01"
+      domain.nic_adapter_count = 50
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+
+    node.vm.network :private_network,
+      #  leaf02-eth1 <--> spine01-eth2
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_ip => "127.123.213.6",
+      :libvirt__tunnel_port => 11149,
+      :libvirt__tunnel_local_ip => "127.123.213.3",
+      :libvirt__tunnel_local_port => 11012,
+      :libvirt__iface_name => "leaf02-eth1-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # leaf02-eth2 <--> cloud-eth2 
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_ip => "127.123.212.6",
+      :libvirt__tunnel_port => 11149,
+      :libvirt__tunnel_local_ip => "127.123.212.3",
+      :libvirt__tunnel_local_port => 11012,
+      :libvirt__iface_name => "cloud-eth2-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        hostname leaf02
+        username admin privilege 15 secret password01 role network-admin
+        !
+        service routing protocols model multi-agent
+        !
+        vrf definition cloud
+        !
+        interface Ethernet1
+           no switchport
+           ip address 10.0.0.1/31
+        !
+        interface Ethernet2
+           no switchport
+           vrf forwarding cloud
+           ip address 10.0.1.2/31
+        !
+        interface Loopback0
+           ip address 10.255.255.3/32
+        !
+        interface Vxlan1
+          vxlan source-interface Loopback0
+          vxlan udp-port 4789
+          vxlan vrf cloud vni 8019
+          vxlan learn-restrict any
+        !
+        ip routing
+        ip routing vrf cloud
+        !
+        ip as-path access-list ACL_CLOUD permit ^7224$ any
+        ip as-path access-list ACL_CLOUD_ORIGINATE permit .*7224$ any
+        !
+        ip prefix-list PL_cloud_out
+           seq 10 permit 10.0.0.0/8
+           seq 20 permit 172.16.0.0/12
+           seq 30 permit 192.168.0.0/16
+        !
+        ip prefix-list allow-all
+           seq 20 permit 0.0.0.0/0 le 32
+        !
+        route-map RM_cloud_in permit 10
+           match as-path ACL_CLOUD
+           set as-path prepend 65351 65351 65351
+        !
+        route-map RM_cloud_out permit 10
+           match ip address prefix-list PL_cloud_out
+           set as-path prepend 65351 65351 65351
+        !
+        route-map RM_Deny_Summary_out deny 10
+           match ip address prefix-list PL_cloud_out
+        !
+        route-map RM_Deny_Summary_out permit 20
+           description permit-all
+           match as-path ACL_CLOUD_ORIGINATE
+        !
+        router bgp 65351
+           neighbor cloud peer-group
+           neighbor cloud route-map RM_cloud_in in
+           neighbor cloud route-map RM_cloud_out out
+           neighbor cloud maximum-routes 12000
+           neighbor evpn peer-group
+           neighbor evpn remote-as 64999
+           neighbor evpn update-source Loopback0
+           neighbor evpn ebgp-multihop 3
+           neighbor evpn send-community extended
+           neighbor evpn maximum-routes 12000 warning-only
+           neighbor 10.0.0.0 remote-as 64999
+           neighbor 10.0.0.0 maximum-routes 12000
+           neighbor 10.255.255.0 peer-group evpn
+           redistribute connected
+           !
+           address-family evpn
+              neighbor evpn activate
+           !
+           address-family ipv4
+              no neighbor evpn activate
+           !
+           vrf cloud
+              rd 10.255.255.3:8019
+              route-target import 8019:8019
+              route-target export 8019:8019
+              route-target export evpn route-map RM_Deny_Summary_out
+              router-id 10.255.255.3
+              neighbor 10.0.1.3 peer-group cloud
+              neighbor 10.0.1.3 remote-as 7224
+              aggregate-address 10.0.0.0/8
+              aggregate-address 172.16.0.0/12
+              aggregate-address 192.168.0.0/16
+        !
+        wr mem"
+      SHELL
+
+  end
+
+  config.vm.define "leaf01" do |node|
+    guest_name = "leaf01"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 1
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:02"
+      domain.nic_adapter_count = 50
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+
+    node.vm.network :private_network,
+      # leaf01-eth1 <--> spine01-eth3
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.213.4",
+      :libvirt__tunnel_local_port => 10012,
+      :libvirt__tunnel_ip => "127.123.213.5",
+      :libvirt__tunnel_port => 10149,
+      :libvirt__iface_name => "leaf01-eth1-#{domain_uuid}",
+      auto_config: false
+
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        !
+        service routing protocols model multi-agent
+        !
+        vrf definition red
+        !
+        hostname leaf01
+        username admin privilege 15 secret password01 role network-admin
+        !
+        interface Ethernet1
+          no switchport
+          ip address 10.0.0.5/31
+        !
+        interface Lo0
+          ip address 10.255.255.1/32
+        !
+        interface Vxlan1
+          vxlan source-interface Loopback0
+          vxlan udp-port 4789
+          vxlan vrf red vni 8019
+          vxlan learn-restrict any
+        !
+        ip routing
+        ip routing vrf red
+        !
+        router bgp 65303
+           neighbor evpn peer group
+           neighbor evpn update-source Loopback0
+           neighbor evpn ebgp-multihop 3
+           neighbor evpn remote-as 64999
+           neighbor evpn send-community extended
+           neighbor evpn maximum-routes 12000 warning-only
+           neighbor 10.0.0.4 remote-as 64999
+           neighbor 10.0.0.4 maximum-routes 12000
+           neighbor 10.255.255.0 peer group evpn
+           redistribute connected
+           !
+           address-family evpn
+              neighbor evpn activate
+           !
+           address-family ipv4
+              no neighbor evpn activate
+           !
+            vrf red
+              rd 10.255.255.1:8019
+        !
+        wr mem"
+      SHELL
+
+  end
+
+  config.vm.define "leaf03" do |node|
+    guest_name = "leaf03"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 1
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:03"
+      domain.nic_adapter_count = 50
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+
+    node.vm.network :private_network,
+      # spine01-eth2 <--> leaf03-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.213.4",
+      :libvirt__tunnel_local_port => 10112,
+      :libvirt__tunnel_ip => "127.123.213.5",
+      :libvirt__tunnel_port => 11149,
+      :libvirt__iface_name => "leaf03-eth1-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # leaf03-eth2  <--> edge01-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.212.3",
+      :libvirt__tunnel_local_port => 10042,
+      :libvirt__tunnel_ip => "127.123.212.6",
+      :libvirt__tunnel_port => 10189,
+      :libvirt__iface_name => "leaf03-eth2-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        service routing protocols model multi-agent
+        !
+        hostname leaf03
+        username admin privilege 15 secret password01 role network-admin
+        interface Ethernet1
+          no switchport
+          ip address 10.0.0.3/31
+        !
+        interface Ethernet2
+          no switchport
+          vrf forwarding red
+          ip address 10.10.0.1/31
+        !
+        interface Lo0
+          ip address 10.255.255.2/32
+        !
+        interface Vxlan1
+          vxlan source-interface Loopback0
+          vxlan udp-port 4789
+          vxlan vrf red vni 8019
+          vxlan learn-restrict any
+        !
+        ip routing
+        ip routing vrf red
+        router bgp 65420
+           neighbor evpn peer group
+           neighbor evpn update-source Loopback0
+           neighbor evpn ebgp-multihop 3
+           neighbor evpn remote-as 64999
+           neighbor evpn send-community extended
+           neighbor 10.0.0.2 remote-as 64999
+           neighbor 10.255.255.0 peer group evpn
+           redistribute connected
+           !
+           address-family evpn
+              neighbor evpn activate
+           !
+           address-family ipv4
+              no neighbor evpn activate
+           !
+           vrf red
+              rd 10.255.255.2:8019
+              route-target export 8019:8019
+              neighbor 10.10.0.0 remote-as 65000
+              neighbor 10.10.0.0 maximum-routes 12000
+          !
+        wr mem"
+      SHELL
+
+  end
+
+  config.vm.define "edge01" do |node|
+    guest_name = "edge01"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 1
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:04"
+      domain.nic_adapter_count = 4
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+  
+    node.vm.network :private_network,
+      #  edge01-eth1 <--> cloud-eth2
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.212.4",
+      :libvirt__tunnel_local_port => 10012,
+      :libvirt__tunnel_ip => "127.123.212.5",
+      :libvirt__tunnel_port => 10149,
+      :libvirt__iface_name => "edge-eth1-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # edge01-eth2 <--> leaf03-eth2 
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.212.6",
+      :libvirt__tunnel_local_port => 10189,
+      :libvirt__tunnel_ip => "127.123.212.3",
+      :libvirt__tunnel_port => 10042,
+      :libvirt__iface_name => "edge-eth2-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        hostname edge01
+        username admin privilege 15 secret password01 role network-admin
+        interface Ethernet1
+          no switchport
+          ip address 10.10.0.5/31
+        interface Ethernet2
+          no switchport
+          ip address 10.10.0.0/31
+        ip routing
+        router bgp 65000
+          neighbor 10.10.0.4 remote-as 7224
+          neighbor 10.10.0.1 remote-as 65420
+        wr mem"
+      SHELL
+
+  end
+
+  config.vm.define "cloud" do |node|
+    guest_name = "cloud"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 1
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:05"
+      domain.nic_adapter_count = 4
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+
+    node.vm.network :private_network,
+      # cloud-eth2 <--> leaf02-eth3
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.212.6",
+      :libvirt__tunnel_local_port => 11149,
+      :libvirt__tunnel_ip => "127.123.212.3",
+      :libvirt__tunnel_port => 11012,
+      :libvirt__iface_name => "cloud-eth2-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # cloud-eth2 <--> edge01-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_ip => "127.123.212.4",
+      :libvirt__tunnel_port => 10012,
+      :libvirt__tunnel_local_ip => "127.123.212.5",
+      :libvirt__tunnel_local_port => 10149,
+      :libvirt__iface_name => "cloud-eth1-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        hostname cloud
+        username admin privilege 15 secret password01 role network-admin
+        !
+        interface Ethernet1
+          no switchport
+          ip address 10.0.1.3/31
+        interface Ethernet2
+          no switchport
+          ip address 10.10.0.4/31
+        !
+        ip routing
+        !
+        ! Advertise a route via BGP
+        ip route 10.21.0.0/16 Null0
+        !
+        ip as-path access-list PERMIT-ORIGINATE-ONLY permit ^$ any
+        !
+        route-map ALLOW-ORIGINATE-ONLY permit 10
+           match as-path PERMIT-ORIGINATE-ONLY
+        !
+        router bgp 7224
+           neighbor external peer-group
+           neighbor external route-map ALLOW-ORIGINATE-ONLY out
+           neighbor external maximum-routes 12000
+           neighbor 10.0.1.2 peer-group external
+           neighbor 10.0.1.2 remote-as 65351
+           neighbor 10.10.0.5 peer-group external
+           neighbor 10.10.0.5 remote-as 65000
+           network 10.21.0.0/16
+           redistribute static
+        ! 
+        wr mem"
+      SHELL
+
+  end
+
+  config.vm.define "spine01" do |node|
+    guest_name = "spine01"
+    node.vm.box = "arista/veos"
+    node.vm.box_version = "4.21.6F"
+    node.vm.synced_folder ".", "/vagrant", id: "vagrant-root", disabled: true
+
+    node.ssh.insert_key = false
+
+    node.vm.provider :libvirt do |domain|
+      domain.default_prefix = "#{domain_prefix}"
+      domain.cpus = 1
+      domain.memory = 2096
+      domain.disk_bus = "ide"
+      domain.management_network_mac = "52:54:00:00:01:06"
+      domain.nic_adapter_count = 4
+      domain.boot 'cdrom'
+      domain.boot 'hd'
+      domain.storage :file, :device => :cdrom, :path => '/var/lib/libvirt/images/Aboot.iso', :dev => 'hdc'
+    end
+
+    node.vm.network :private_network,
+      # spine01-eth1 <--> leaf02-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_local_ip => "127.123.213.6",
+      :libvirt__tunnel_local_port => 11149,
+      :libvirt__tunnel_ip => "127.123.213.3",
+      :libvirt__tunnel_port => 11012,
+      :libvirt__iface_name => "spine01-eth1-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # spine01-eth2 <--> leaf03-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_ip => "127.123.213.4",
+      :libvirt__tunnel_port => 10112,
+      :libvirt__tunnel_local_ip => "127.123.213.5",
+      :libvirt__tunnel_local_port => 11149,
+      :libvirt__iface_name => "spine01-eth2-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.network :private_network,
+      # spine01-eth3 <--> leaf01-eth1
+      :mac => "#{get_mac()}",
+      :libvirt__tunnel_type => "udp",
+      :libvirt__tunnel_ip => "127.123.213.4",
+      :libvirt__tunnel_port => 10012,
+      :libvirt__tunnel_local_ip => "127.123.213.5",
+      :libvirt__tunnel_local_port => 10149,
+      :libvirt__iface_name => "spine01-eth3-#{domain_uuid}",
+      auto_config: false
+
+    node.vm.provision 'shell', inline: <<-SHELL
+        sleep 5
+        FastCli -p 15 -c "configure
+        !
+        service routing protocols model multi-agent
+        !
+        hostname spine01
+        username admin privilege 15 secret password01 role network-admin
+        interface Ethernet1
+          no switchport
+          ip address 10.0.0.0/31
+        interface Ethernet2
+          no switchport
+          ip address 10.0.0.2/31
+        interface Ethernet3
+          no switchport
+          ip address 10.0.0.4/31
+        interface Loopback0
+          ip address 10.255.255.0/32
+        ip routing
+        router bgp 64999
+          neighbor 10.0.0.1 remote-as 65351
+          neighbor 10.0.0.3 remote-as 65420
+          neighbor 10.0.0.5 remote-as 65303
+          neighbor evpn next-hop-unchanged
+          neighbor evpn update-source Loopback0
+          neighbor evpn ebgp-multihop 3
+          neighbor evpn send-community extended
+          neighbor 10.255.255.1 peer-group evpn
+          neighbor 10.255.255.1 remote-as 65303
+          neighbor 10.255.255.2 peer-group evpn
+          neighbor 10.255.255.2 remote-as 65420
+          neighbor 10.255.255.3 peer-group evpn
+          neighbor 10.255.255.3 remote-as 65351
+          redistribute connected
+          !
+          address-family evpn
+             neighbor evpn activate
+          !
+          address-family ipv4
+             no neighbor evpn activate
+          !
+        wr mem"
+      SHELL
+
+  end
+
+end
